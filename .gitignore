@@ -1,3 +1,4 @@
+.claude/
 .venv/
 __pycache__/
 *.pyc
@@ -15,3 +16,4 @@ wandb/
 .vscode/
 logs/
 *.log
+plot_norm/figs/

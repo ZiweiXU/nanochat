@@ -20,7 +20,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ipykernel>=7.1.0",
+    "kaleido>=1.2.0",
     "matplotlib>=3.10.8",
+    "nbclient>=0.10.4",
+    "plotly>=6.7.0",
     "pytest>=8.0.0",
     "python-dotenv>=1.2.1",
     "transformers>=4.57.3",
