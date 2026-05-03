@@ -15,5 +15,6 @@ wandb/
 .claude/settings.json
 .vscode/
 logs/
+logs_hf/
 *.log
 plot_norm/figs/

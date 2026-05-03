@@ -141,6 +141,26 @@ class HiddenNorms:
 
 
 @dataclass
+class RoleMask:
+    """Per-token role mask written by hf_sft.grad_monitor_hf.
+
+    role_mask[s, a, r, b, t] is one of {0=PAD, 1=PROMPT, 2=ANSWER}; the
+    legend ``role_legend = ['pad', 'prompt', 'answer']`` confirms this.
+
+    Only present for SFT runs from the HF trainer — pretraining and
+    nanochat SFT runs do not write a mask file. ``read_mask`` raises
+    ``FileNotFoundError`` if no mask files are present.
+    """
+    role_mask: np.ndarray         # (S, A, R, B, T) uint8
+    role_legend: List[str]        # ["pad", "prompt", "answer"]
+    global_steps: np.ndarray      # (S,) int32
+    seq_len: int
+    device_batch_size: int
+    world_size: int
+    grad_accum_steps: int
+
+
+@dataclass
 class AttnNorms:
     """Dequantized Q / K / V per-head norms over a global-step range.
 
@@ -171,7 +191,7 @@ class AttnNorms:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-_FNAME_RE = re.compile(r"step_(\d+)-(\d+)_(hidden|attn)\.npz$")
+_FNAME_RE = re.compile(r"step_(\d+)-(\d+)_(hidden|attn|mask)\.npz$")
 
 
 def _discover_files(norms_dir: str, modality: str,
@@ -185,7 +205,7 @@ def _discover_files(norms_dir: str, modality: str,
     the bracket is sparse. The bracket is still a sound coarse-overlap test:
     any file with at least one recorded step inside [step_start, step_end]
     must have ``first <= step_end`` and ``last >= step_start``."""
-    assert modality in ("hidden", "attn")
+    assert modality in ("hidden", "attn", "mask")
     if step_start > step_end:
         raise ValueError(f"step_start ({step_start}) > step_end ({step_end})")
 
@@ -375,6 +395,75 @@ def read_both(norms_dir: str, step_start: int,
     """Convenience: read both modalities for the same step range."""
     return (read_hidden(norms_dir, step_start, step_end),
             read_attn(norms_dir, step_start, step_end))
+
+
+def read_mask(norms_dir: str, step_start: int, step_end: int) -> RoleMask:
+    """Read the per-token role mask written by SFT runs (hf_sft).
+
+    Only present for runs that called ``HFGradientBiasMonitor.record_mask`` —
+    pretraining runs and nanochat SFT runs don't write mask files. Raises
+    ``FileNotFoundError`` if no mask file overlaps the requested range.
+    """
+    files = _discover_files(norms_dir, "mask", step_start, step_end)
+
+    parts, steps_parts = [], []
+    meta = None
+    for _f, _l, path in files:
+        d = np.load(path)
+        gs = d["global_steps"]
+        keep = (gs >= step_start) & (gs <= step_end)
+        if not keep.any():
+            continue
+
+        rm = d["role_mask"]
+        parts.append(rm[keep])
+        steps_parts.append(gs[keep])
+
+        if meta is None:
+            meta = dict(
+                role_legend=[str(s) for s in d["role_legend"]],
+                seq_len=int(d["seq_len"]),
+                device_batch_size=int(d["device_batch_size"]),
+                world_size=int(d["world_size"]),
+                grad_accum_steps=int(d["grad_accum_steps"]),
+            )
+
+    if not parts:
+        raise FileNotFoundError(
+            f"no mask records for global_step in [{step_start},{step_end}]")
+    return RoleMask(
+        role_mask=np.concatenate(parts, axis=0),
+        global_steps=np.concatenate(steps_parts, axis=0).astype(np.int32),
+        **meta,
+    )
+
+
+def filter_by_role(norm_arr: np.ndarray, role_mask: np.ndarray,
+                    role: int) -> np.ndarray:
+    """Replace positions whose role != target with NaN, returning float32.
+
+    ``norm_arr`` is a hidden / attn norm array shaped
+    ``(S, A, R, B, L, T)`` or ``(S, A, R, B, L, T, H)`` (any number of
+    trailing axes). ``role_mask`` is shaped ``(S, A, R, B, T)`` (no L
+    or H axes — the role is per-token).
+
+    The output has the same shape as ``norm_arr`` with NaN at positions
+    where ``role_mask != role``. Useful for averaging only over a single
+    role (e.g. via ``np.nanmean``) when plotting per-position curves.
+    """
+    if role_mask.shape[:4] != norm_arr.shape[:4] or role_mask.shape[-1] != norm_arr.shape[5]:
+        raise ValueError(
+            f"role_mask shape {role_mask.shape} incompatible with "
+            f"norm shape {norm_arr.shape}; expected (S, A, R, B, T) matching axes 0..3 + 5")
+    out = norm_arr.astype(np.float32, copy=True)
+    # Broadcast mask: (S, A, R, B, T) -> (S, A, R, B, 1, T[, 1...])
+    bcast_shape = list(role_mask.shape)
+    bcast_shape.insert(4, 1)  # L axis
+    while len(bcast_shape) < out.ndim:
+        bcast_shape.append(1)  # head axis (or any further trailing)
+    keep = (role_mask.reshape(bcast_shape) == role)
+    out[~np.broadcast_to(keep, out.shape)] = np.nan
+    return out
 
 
 # ---------------------------------------------------------------------------
