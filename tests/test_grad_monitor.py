@@ -23,6 +23,13 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# Force SDPA fallback before nanochat.gpt imports flash_attention. On a
+# Hopper box FA3 loads at import time and USE_FA3 latches to True, but
+# this CPU smoke test needs the SDPA path.
+import nanochat.flash_attention as _fa  # noqa: E402
+_fa._override_impl = 'sdpa'
+_fa.USE_FA3 = False
+
 from nanochat.gpt import GPT, GPTConfig
 from scripts_dev.grad_monitor import GradientBiasMonitor
 

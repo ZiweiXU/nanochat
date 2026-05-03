@@ -127,6 +127,27 @@ uv sync --extra cpu --group dev    # or --extra gpu on H100
 # expect: 3/3 passed
 ```
 
+### Devbox quirks (this devbox: `devbox-b-h98wv`)
+
+- **Python venv**: `UV_PROJECT_ENVIRONMENT=/opt/uv/venv` — the canonical
+  `.venv/bin/python` paths in this doc resolve to `/opt/uv/venv/bin/python`
+  here. The interpreter is also on `PATH` via `/opt/uv/venv/bin`, but
+  `python` resolves to conda first; use the absolute path.
+- **GPU count**: 1× H100 80GB (driver 570.124.06, CUDA 12.8). The 8-GPU
+  torchrun example below won't work as-is; drop to single-GPU.
+- **`tests/test_grad_monitor.py` on Hopper boxes**: FA3 latches
+  `USE_FA3=True` at import time when CUDA is available, breaking the
+  CPU-only test. The test now forces SDPA via
+  `nanochat.flash_attention._override_impl='sdpa'; .USE_FA3=False`
+  before importing `nanochat.gpt`. Don't revert.
+- **torch.compile / inductor needs setuptools** — not in the lock file.
+  `uv pip install setuptools` once after `uv sync`.
+- **Notebook PNG export needs Chrome system libs** (libnspr4, libnss3,
+  ...). `plotly_get_chrome` ships the binary but headless launch fails
+  here without sudo apt. The pipeline test
+  (`tests/test_plot_norm_pipeline.py`) is the authoritative validator;
+  PNG render is a separate ergonomic step.
+
 ## Plan for the H100 run
 
 1. **Pretrain a base** (or reuse an existing nanochat checkpoint). For
@@ -175,6 +196,15 @@ uv sync --extra cpu --group dev    # or --extra gpu on H100
   alarmed by zero Q/K/V grads in toy tests; do be alarmed in real runs.
 - **`torch.compile` warm-up**: first SFT step on Mac took ~22s; after
   that ~50–80ms/step. Negligible on H100 but budget for it on smoke runs.
+- **`--num-iterations` semantics in SFT scripts**: counts dataloader
+  yields (micro-steps), NOT optimizer steps. With `grad_accum_steps=16`,
+  `--num-iterations=50` produces ~3 optimizer steps. To run K optimizer
+  steps, pass `--num-iterations=K * grad_accum_steps`. Same convention
+  is in upstream `scripts/chat_sft.py`.
+- **`--minimal-data` runs end fast**: train dataset = 1000 rows of
+  identity_conversations only, and `consumed >= dataset_size` toggles
+  `last_step=True` on the first epoch. Expect ~5 optimizer steps before
+  shutdown — fine for plumbing tests, not enough for analysis.
 
 ## File map (relative to repo root)
 
@@ -196,6 +226,8 @@ plot_norm/
 dev/
   HANDOFF.md                 # this file
   LOG.md                     # project's chronological experiment log
+  setup_smoke_base.py        # bootstraps a random-init base + tiny tokenizer
+                             # for plumbing-only smoke runs (Path B)
 ```
 
 ## What I'd do first on the H100 machine
