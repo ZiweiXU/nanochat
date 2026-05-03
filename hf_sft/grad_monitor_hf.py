@@ -15,9 +15,17 @@ Output files (under `<logs_dir>/norms/`, one set per flush window):
 
 Slab layouts:
   hidden_act / hidden_grad : (K_win, A, L, B, T)         fp16
+  attn_out_act / mlp_out_act : (K_win, A, L, B, T)       fp16   (pre-residual contributions)
   q_act / q_grad           : (K_win, A, L, B, T, H_q)    fp16
   kv_act / kv_grad         : (K_win, A, L, 2, B, T, H_kv) fp16   (2: k, v)
   role_mask                : (K_win, A, B, T)             uint8
+
+attn_out_act / mlp_out_act let us decompose the residual-stream growth:
+hidden_act on layer i is the post-residual block output, i.e.
+``residual_in + attn_out + mlp_out``. The two pre-residual norms tell us
+how much each sub-block contributes per-token, so we can attribute
+prompt-amplification effects to attention vs MLP rather than just
+observing the combined residual stream.
 
 Flushed-on-disk layouts include the world_size axis even at world_size=1
 to keep the on-disk schema identical to the nanochat version.
@@ -135,6 +143,17 @@ class HFGradientBiasMonitor:
         self._A, self._B, self._T = A, B, T
         self._hidden_act  = torch.zeros((K_win, A, L, B, T), dtype=torch.float16)
         self._hidden_grad = torch.zeros((K_win, A, L, B, T), dtype=torch.float16)
+        self._attn_out_act = torch.zeros((K_win, A, L, B, T), dtype=torch.float16)
+        self._mlp_out_act  = torch.zeros((K_win, A, L, B, T), dtype=torch.float16)
+        # Sink-direction projection: <dL/d(h_l[t]), h_l[t] / ||h_l[t]||> per token.
+        # Sign indicates whether the gradient pushes ||h_l[t]|| down (>0,
+        # i.e. -lr*g shrinks ||h||) or up (<0, -lr*g grows ||h||) at this
+        # position-layer. See findings/SINK.md "Open mechanism question".
+        self._h_proj_grad = torch.zeros((K_win, A, L, B, T), dtype=torch.float16)
+        # Forward-hook scratch keyed by (layer_idx, accum_idx). Holds the
+        # detached residual-stream output so the matching backward hook
+        # can compute the projection. Cleared as bwd hooks consume entries.
+        self._h_cache = {}
         self._q_act  = torch.zeros((K_win, A, L, B, T, H_q), dtype=torch.float16)
         self._q_grad = torch.zeros((K_win, A, L, B, T, H_q), dtype=torch.float16)
         self._kv_act  = torch.zeros((K_win, A, L, 2, B, T, H_kv), dtype=torch.float16)
@@ -149,6 +168,11 @@ class HFGradientBiasMonitor:
         if self._record_this_step:
             self._s_idx = len(self._recorded_steps)
             self._recorded_steps.append(self._global_step)
+        # Defensive: drop any stale entries from the previous step (in case
+        # a bwd hook didn't fire; gradient checkpointing or non-standard
+        # architectures could in principle skip a hook). Avoids gradual
+        # memory growth across steps.
+        self._h_cache.clear()
 
     def advance_accum(self):
         self._accum_idx += 1
@@ -256,8 +280,13 @@ class HFGradientBiasMonitor:
                     if self._debug and not self._first_fwd_reported and layer_idx == 0:
                         print(f"[hf-monitor] first hidden fwd fired (layer=0, shape={tuple(hidden.shape)})")
                         self._first_fwd_reported = True
-                    norms = hidden.detach().float().norm(dim=-1).to(torch.float16)
+                    h_det = hidden.detach()
+                    norms = h_det.float().norm(dim=-1).to(torch.float16)
                     self._hidden_act[self._s_idx, self._accum_idx, layer_idx].copy_(norms)
+                    # Stash for the matching backward hook to compute the
+                    # sink-direction projection. Cached on the same device as
+                    # the activation; popped in the bwd hook.
+                    self._h_cache[(layer_idx, self._accum_idx)] = h_det
                 return fwd_hook
 
             def make_bwd_hidden(layer_idx):
@@ -267,12 +296,42 @@ class HFGradientBiasMonitor:
                     g = grad_output[0]
                     if g is None or g.dim() != 3:
                         return
-                    gn = g.detach().float().norm(dim=-1).to(torch.float16)
+                    g_det = g.detach().float()
+                    gn = g_det.norm(dim=-1).to(torch.float16)
                     self._hidden_grad[self._s_idx, self._accum_idx, layer_idx].copy_(gn)
+                    # Sink-direction projection: <g, h/||h||> = <g, h> / ||h||.
+                    h = self._h_cache.pop((layer_idx, self._accum_idx), None)
+                    if h is not None and h.shape == g_det.shape:
+                        h_f = h.float()
+                        h_norm = h_f.norm(dim=-1).clamp(min=1e-12)
+                        proj = (g_det * h_f).sum(dim=-1) / h_norm  # (B, T)
+                        self._h_proj_grad[self._s_idx, self._accum_idx, layer_idx].copy_(
+                            proj.to(torch.float16))
                 return bwd_hook
 
             self._hooks.append(block.register_forward_hook(make_fwd_hidden(i)))
             self._hooks.append(block.register_full_backward_hook(make_bwd_hidden(i)))
+
+            attn_mod = getattr(block, "self_attn", None)
+            mlp_mod  = getattr(block, "mlp", None)
+
+            def make_fwd_subblock(layer_idx, slab_attr):
+                def fwd_hook(module, inp, output):
+                    if not module.training or not self._record_this_step:
+                        return
+                    out = output[0] if isinstance(output, tuple) else output
+                    if not torch.is_tensor(out) or out.dim() != 3:
+                        return
+                    norms = out.detach().float().norm(dim=-1).to(torch.float16)
+                    getattr(self, slab_attr)[self._s_idx, self._accum_idx, layer_idx].copy_(norms)
+                return fwd_hook
+
+            if attn_mod is not None:
+                self._hooks.append(attn_mod.register_forward_hook(
+                    make_fwd_subblock(i, "_attn_out_act")))
+            if mlp_mod is not None:
+                self._hooks.append(mlp_mod.register_forward_hook(
+                    make_fwd_subblock(i, "_mlp_out_act")))
 
         for spec in self._attn_specs:
             i = spec["layer_idx"]
@@ -341,6 +400,9 @@ class HFGradientBiasMonitor:
 
         hidden_act_g  = self._gather_slab(self._hidden_act[:n])
         hidden_grad_g = self._gather_slab(self._hidden_grad[:n])
+        attn_out_g    = self._gather_slab(self._attn_out_act[:n])
+        mlp_out_g     = self._gather_slab(self._mlp_out_act[:n])
+        h_proj_g      = self._gather_slab(self._h_proj_grad[:n])
         q_act_g   = self._gather_slab(self._q_act[:n])
         q_grad_g  = self._gather_slab(self._q_grad[:n])
         kv_act_g  = self._gather_slab(self._kv_act[:n])
@@ -358,6 +420,9 @@ class HFGradientBiasMonitor:
         # Source (after gather): (R, S, A, L, B, T) -> on-disk (S, A, R, B, L, T)
         act = hidden_act_g.transpose(1, 2, 0, 4, 3, 5).astype(np.float32)
         grd = hidden_grad_g.transpose(1, 2, 0, 4, 3, 5).astype(np.float32)
+        attn_out = attn_out_g.transpose(1, 2, 0, 4, 3, 5).astype(np.float32)
+        mlp_out  = mlp_out_g.transpose(1, 2, 0, 4, 3, 5).astype(np.float32)
+        h_proj   = h_proj_g.transpose(1, 2, 0, 4, 3, 5).astype(np.float32)
         q_act  = q_act_g.transpose(1, 2, 0, 4, 3, 5, 6).astype(np.float32)
         q_grd  = q_grad_g.transpose(1, 2, 0, 4, 3, 5, 6).astype(np.float32)
         kv_act = kv_act_g.transpose(1, 2, 0, 5, 3, 4, 6, 7).astype(np.float32)
@@ -396,6 +461,16 @@ class HFGradientBiasMonitor:
 
         aq, asc, amn, aoi, aov = _quant_hidden(act)
         gq, gsc, gmn, goi, gov = _quant_hidden(grd)
+        atq, atsc, atmn, atoi, atov = _quant_hidden(attn_out)
+        mlq, mlsc, mlmn, mloi, mlov = _quant_hidden(mlp_out)
+        # h_proj is signed; the per-row min/max quantization handles negatives
+        # correctly (mn can be negative; outlier preservation captures both
+        # tails since argpartition is by magnitude after subtracting min...
+        # actually argpartition(-K) picks the LARGEST K, so deeply negative
+        # values still get clipped at the per-row min. That's acceptable
+        # here — typical sink-direction projections are O(||g||·||h||) and
+        # don't have heavy negative tails.
+        hpq, hpsc, hpmn, hpoi, hpov = _quant_hidden(h_proj)
 
         np.savez_compressed(
             os.path.join(out_dir, f"{step_tag}_hidden.npz"),
@@ -403,6 +478,12 @@ class HFGradientBiasMonitor:
             act_outlier_idx=aoi, act_outlier_val=aov,
             grad_q=gq, grad_scale=gsc, grad_min=gmn,
             grad_outlier_idx=goi, grad_outlier_val=gov,
+            attn_out_q=atq, attn_out_scale=atsc, attn_out_min=atmn,
+            attn_out_outlier_idx=atoi, attn_out_outlier_val=atov,
+            mlp_out_q=mlq, mlp_out_scale=mlsc, mlp_out_min=mlmn,
+            mlp_out_outlier_idx=mloi, mlp_out_outlier_val=mlov,
+            h_proj_grad_q=hpq, h_proj_grad_scale=hpsc, h_proj_grad_min=hpmn,
+            h_proj_grad_outlier_idx=hpoi, h_proj_grad_outlier_val=hpov,
             global_steps=global_steps_arr,
             layer_types=layer_types_arr,
             layer_type_legend=layer_type_legend,

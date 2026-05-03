@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Optional
 
@@ -158,6 +159,73 @@ def load_smoltalk(split: str = "train") -> List[List[dict]]:
     return [row["messages"] for row in ds]
 
 
+_MMLU_LETTERS = ("A", "B", "C", "D")
+
+
+def _render_mc(question: str, choices: List[str]) -> str:
+    """Match nanochat's `tasks.common.render_mc` so the prompt-format
+    distribution is identical between the two SFT paths. Letter is
+    placed AFTER the choice (better small-model binding) and there is
+    no whitespace between '=' and the letter (different token id)."""
+    q = f"Multiple Choice question: {question}\n"
+    q += "".join(f"- {choice}={letter}\n" for letter, choice in zip(_MMLU_LETTERS, choices))
+    q += "\nRespond only with the letter of the correct answer."
+    return q
+
+
+def load_mmlu(split: str = "auxiliary_train", limit: Optional[int] = None) -> List[List[dict]]:
+    """Load cais/mmlu and convert each row to a [user, assistant] message
+    pair. Mirrors `tasks.mmlu.MMLU.get_example`. The assistant message is
+    the single answer letter — short ANSWER spans, but matches what the
+    nanochat path trains on."""
+    from datasets import load_dataset
+    ds = load_dataset("cais/mmlu", "all", split=split).shuffle(seed=42)
+    if limit is not None:
+        ds = ds.select(range(min(limit, len(ds))))
+    out: List[List[dict]] = []
+    for row in ds:
+        choices = row["choices"]
+        if len(choices) != 4:
+            continue
+        user_msg = _render_mc(row["question"], choices)
+        assistant_msg = _MMLU_LETTERS[row["answer"]]
+        out.append([
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": assistant_msg},
+        ])
+    return out
+
+
+_GSM_TOOL_RE = re.compile(r"<<[^>]+>>")
+
+
+def _render_gsm_solution(answer: str) -> str:
+    """Strip GSM8K's `<<expr=result>>` calculator markers, leaving the
+    plain reasoning + final `#### N` line. The nanochat path keeps the
+    markers as tool calls, but for HF chat templates we need string
+    content; the `#### N` final-answer marker is preserved so eval
+    extractors keep working."""
+    return _GSM_TOOL_RE.sub("", answer)
+
+
+def load_gsm8k(subset: str = "main", split: str = "train",
+               limit: Optional[int] = None) -> List[List[dict]]:
+    """Load openai/gsm8k as [user, assistant] message pairs. Calculator
+    tool markers are stripped — the model sees natural reasoning text
+    ending in `#### N`."""
+    from datasets import load_dataset
+    ds = load_dataset("openai/gsm8k", subset, split=split).shuffle(seed=42)
+    if limit is not None:
+        ds = ds.select(range(min(limit, len(ds))))
+    out: List[List[dict]] = []
+    for row in ds:
+        out.append([
+            {"role": "user", "content": row["question"]},
+            {"role": "assistant", "content": _render_gsm_solution(row["answer"])},
+        ])
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Tokenized-row dataset
 
@@ -200,16 +268,27 @@ class SFTDataset(Dataset):
 def make_default_dataset(tokenizer, max_seq_len: int, *,
                          identity_path: Optional[str] = None,
                          use_smoltalk: bool = False,
-                         smoltalk_split: str = "train") -> SFTDataset:
-    """Pragmatic default dataset for the first pilot:
-    identity_conversations + (optionally) SmolTalk train.
-    """
+                         smoltalk_split: str = "train",
+                         use_mmlu: bool = False,
+                         mmlu_split: str = "auxiliary_train",
+                         mmlu_limit: Optional[int] = None,
+                         use_gsm8k: bool = False,
+                         gsm8k_split: str = "train",
+                         gsm8k_limit: Optional[int] = None) -> SFTDataset:
+    """Pragmatic default dataset: identity_conversations + any subset of
+    {SmolTalk, MMLU auxiliary_train, GSM8K train}. Limits exist because
+    MMLU auxiliary_train is ~100k rows — full mixture overwhelms the
+    SmolTalk + identity scale by 30×, distorting the role-mask stats."""
     convs: List[List[dict]] = []
     if identity_path is not None and os.path.exists(identity_path):
         convs.extend(load_identity_jsonl(identity_path))
     if use_smoltalk:
         convs.extend(load_smoltalk(split=smoltalk_split))
+    if use_mmlu:
+        convs.extend(load_mmlu(split=mmlu_split, limit=mmlu_limit))
+    if use_gsm8k:
+        convs.extend(load_gsm8k(split=gsm8k_split, limit=gsm8k_limit))
     if not convs:
         raise ValueError("make_default_dataset needs at least one source "
-                         "(identity_path or use_smoltalk)")
+                         "(identity_path or use_smoltalk/mmlu/gsm8k)")
     return SFTDataset(convs, tokenizer=tokenizer, max_seq_len=max_seq_len)

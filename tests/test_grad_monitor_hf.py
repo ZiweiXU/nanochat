@@ -106,6 +106,31 @@ def test_role_mask_multiturn(tok):
 
 
 # -----------------------------------------------------------------------------
+# Source-renderer tests (no network)
+
+def test_mmlu_render():
+    from hf_sft.data import _render_mc
+    q = _render_mc("What is 2+2?", ["3", "4", "5", "6"])
+    # Letter is AFTER the choice with no space before it (binding-critical).
+    _check("- 4=B\n" in q, f"expected '- 4=B' in {q!r}")
+    _check(q.endswith("Respond only with the letter of the correct answer."),
+           "MMLU prompt missing instruction tail")
+    print("PASS  test_mmlu_render  (letter-after-choice format intact)")
+
+
+def test_gsm8k_render():
+    from hf_sft.data import _render_gsm_solution
+    raw = ("Weng earns 12/60 = $<<12/60=0.2>>0.2 per minute.\n"
+           "Working 50 minutes, she earned 0.2 x 50 = $<<0.2*50=10>>10\n"
+           "#### 10")
+    out = _render_gsm_solution(raw)
+    _check("<<" not in out and ">>" not in out, f"calculator markers not stripped: {out!r}")
+    _check("#### 10" in out, "final-answer marker dropped")
+    _check("$0.2 per minute" in out, "non-marker text damaged")
+    print("PASS  test_gsm8k_render  (<<...>> stripped, #### preserved)")
+
+
+# -----------------------------------------------------------------------------
 # Monitor end-to-end test
 
 def _build_tiny_llama(vocab_size: int):
@@ -188,6 +213,12 @@ def test_monitor_end_to_end(tok):
         _check(any(f.endswith("_attn.npz") for f in files),   f"no _attn.npz in {files}")
         _check(any(f.endswith("_mask.npz") for f in files),   f"no _mask.npz in {files}")
 
+        # Subblock attribution + sink-direction projection fields must be present.
+        hidden_npz = next(p for p in norms_dir.iterdir() if p.name.endswith("_hidden.npz"))
+        with np.load(hidden_npz) as z:
+            for k in ("attn_out_q", "mlp_out_q", "h_proj_grad_q"):
+                _check(k in z.files, f"{k} missing from hidden.npz")
+
         # Mask file shape: (S, A, R, B, T) uint8
         mask_npz = next(p for p in norms_dir.iterdir() if p.name.endswith("_mask.npz"))
         with np.load(mask_npz) as z:
@@ -209,9 +240,20 @@ def main():
     tok = _load_tokenizer()
     print(f"[setup] tokenizer={TOKENIZER_ID} vocab_size={tok.vocab_size}")
     failures = 0
-    for fn in (test_role_mask_singleturn,
-               test_role_mask_multiturn,
-               test_monitor_end_to_end):
+    no_arg_tests = (test_mmlu_render, test_gsm8k_render)
+    tok_tests = (test_role_mask_singleturn,
+                 test_role_mask_multiturn,
+                 test_monitor_end_to_end)
+    for fn in no_arg_tests:
+        try:
+            fn()
+        except AssertionError as e:
+            print(f"FAIL  {fn.__name__}: {e}")
+            failures += 1
+        except Exception as e:
+            print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
+            failures += 1
+    for fn in tok_tests:
         try:
             fn(tok)
         except AssertionError as e:
@@ -220,7 +262,7 @@ def main():
         except Exception as e:
             print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
             failures += 1
-    total = 3
+    total = len(no_arg_tests) + len(tok_tests)
     print(f"\n{total - failures}/{total} passed")
     if failures:
         sys.exit(1)

@@ -50,6 +50,13 @@ def parse_args() -> argparse.Namespace:
                                         "identity_conversations.jsonl"))
     p.add_argument("--use-smoltalk", action="store_true",
                    help="include HuggingFaceTB/smoltalk train split in mixture")
+    p.add_argument("--use-mmlu", action="store_true",
+                   help="include cais/mmlu auxiliary_train in mixture")
+    p.add_argument("--mmlu-limit", type=int, default=20000,
+                   help="cap MMLU rows (auxiliary_train is ~100k; default keeps it from dwarfing other sources)")
+    p.add_argument("--use-gsm8k", action="store_true",
+                   help="include openai/gsm8k train in mixture")
+    p.add_argument("--gsm8k-limit", type=int, default=None)
     # Compute
     p.add_argument("--device-batch-size", type=int, default=2)
     p.add_argument("--max-seq-len", type=int, default=2048)
@@ -65,6 +72,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--monitor-steps-per-file", type=int, default=5)
     p.add_argument("--monitor-outlier-pct", type=float, default=0.01)
     p.add_argument("--monitor-debug", action="store_true")
+    p.add_argument("--save-checkpoint", action="store_true",
+                   help="save model+tokenizer at end of training to logs_dir/checkpoint/ "
+                        "(adds ~1.2GB for Qwen3-0.6B; needed for any post-hoc forward-pass analysis)")
     return p.parse_args()
 
 
@@ -112,6 +122,10 @@ def main():
         tok, max_seq_len=args.max_seq_len,
         identity_path=args.identity_path,
         use_smoltalk=args.use_smoltalk,
+        use_mmlu=args.use_mmlu,
+        mmlu_limit=args.mmlu_limit,
+        use_gsm8k=args.use_gsm8k,
+        gsm8k_limit=args.gsm8k_limit,
     )
     if len(ds) == 0:
         raise SystemExit("dataset is empty after length filtering — increase --max-seq-len?")
@@ -228,6 +242,12 @@ def main():
     # End-of-training: force-flush partial window and remove hooks.
     monitor.flush(args.num_opt_steps - 1, force=True)
     monitor.remove_hooks()
+
+    if args.save_checkpoint:
+        ckpt_dir = os.path.join(logs_dir, "checkpoint")
+        print(f"[hf-sft] saving checkpoint to {ckpt_dir} ...")
+        model.save_pretrained(ckpt_dir)
+        tok.save_pretrained(ckpt_dir)
 
     total = time.time() - t0
     print(f"[hf-sft] done in {total:.1f}s "

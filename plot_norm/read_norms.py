@@ -110,7 +110,7 @@ import os
 import re
 import glob
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -128,7 +128,7 @@ class HiddenNorms:
     may be sparse (e.g. ``[0, 20, 40]``) — never assume S equals the width
     of the requested range.
     """
-    act: np.ndarray            # (S, A, R, B, L, T) float32   activation norms
+    act: np.ndarray            # (S, A, R, B, L, T) float32   activation norms (post-residual)
     grad: np.ndarray           # (S, A, R, B, L, T) float32   gradient norms
     global_steps: np.ndarray   # (S,) int32                   step id per axis-0 slice
     layer_types: List[str]     # length L
@@ -138,6 +138,17 @@ class HiddenNorms:
     world_size: int            # R
     grad_accum_steps: int      # A
     outlier_pct: float         # fraction of values kept losslessly per sample
+    # Pre-residual sub-block contributions (None on older runs that didn't
+    # record them). Use these to attribute the post-residual ``act`` growth
+    # to attention vs MLP — they have the same shape as ``act``.
+    attn_out: Optional[np.ndarray] = None
+    mlp_out: Optional[np.ndarray] = None
+    # Sink-direction projection of the residual gradient onto the unit
+    # residual direction: <dL/dh, h/||h||> per token. Signed. Same shape
+    # as ``act`` / ``grad``. ``None`` for runs that pre-date the
+    # h_proj_grad recording. Sign convention: positive => -lr*grad
+    # shrinks ||h|| at this position (loss prefers smaller norm).
+    h_proj_grad: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -281,6 +292,10 @@ def read_hidden(norms_dir: str, step_start: int, step_end: int) -> HiddenNorms:
     files = _discover_files(norms_dir, "hidden", step_start, step_end)
 
     act_parts, grad_parts, steps_parts = [], [], []
+    attn_out_parts, mlp_out_parts = [], []
+    h_proj_parts = []
+    has_subblock = None
+    has_h_proj = None
     meta = None
     for _f, _l, path in files:
         d = np.load(path)
@@ -297,6 +312,33 @@ def read_hidden(norms_dir: str, step_start: int, step_end: int) -> HiddenNorms:
         grad_parts.append(grd[keep])
         steps_parts.append(gs[keep])
 
+        file_has_subblock = "attn_out_q" in d.files and "mlp_out_q" in d.files
+        if has_subblock is None:
+            has_subblock = file_has_subblock
+        elif has_subblock != file_has_subblock:
+            has_subblock = False
+            attn_out_parts.clear()
+            mlp_out_parts.clear()
+        if has_subblock and file_has_subblock:
+            attn_out = _dequantize(d["attn_out_q"], d["attn_out_scale"], d["attn_out_min"],
+                                   d["attn_out_outlier_idx"], d["attn_out_outlier_val"])
+            mlp_out = _dequantize(d["mlp_out_q"], d["mlp_out_scale"], d["mlp_out_min"],
+                                  d["mlp_out_outlier_idx"], d["mlp_out_outlier_val"])
+            attn_out_parts.append(attn_out[keep])
+            mlp_out_parts.append(mlp_out[keep])
+
+        file_has_h_proj = "h_proj_grad_q" in d.files
+        if has_h_proj is None:
+            has_h_proj = file_has_h_proj
+        elif has_h_proj != file_has_h_proj:
+            has_h_proj = False
+            h_proj_parts.clear()
+        if has_h_proj and file_has_h_proj:
+            hp = _dequantize(d["h_proj_grad_q"], d["h_proj_grad_scale"],
+                             d["h_proj_grad_min"], d["h_proj_grad_outlier_idx"],
+                             d["h_proj_grad_outlier_val"])
+            h_proj_parts.append(hp[keep])
+
         if meta is None:
             meta = dict(
                 layer_types=_decode_layer_types(d),
@@ -312,10 +354,16 @@ def read_hidden(norms_dir: str, step_start: int, step_end: int) -> HiddenNorms:
         raise FileNotFoundError(
             f"no hidden records for global_step in [{step_start},{step_end}]")
 
+    attn_out_arr = np.concatenate(attn_out_parts, axis=0) if attn_out_parts else None
+    mlp_out_arr = np.concatenate(mlp_out_parts, axis=0) if mlp_out_parts else None
+    h_proj_arr = np.concatenate(h_proj_parts, axis=0) if h_proj_parts else None
     return HiddenNorms(
         act=np.concatenate(act_parts, axis=0),
         grad=np.concatenate(grad_parts, axis=0),
         global_steps=np.concatenate(steps_parts, axis=0).astype(np.int32),
+        attn_out=attn_out_arr,
+        mlp_out=mlp_out_arr,
+        h_proj_grad=h_proj_arr,
         **meta,
     )
 
